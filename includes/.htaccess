@@ -1,0 +1,6 @@
+# includes/ holds PHP logic - deny EVERYTHING from the web.
+Require all denied
+
+<IfModule mod_php.c>
+    php_flag engine Off
+</IfModule>

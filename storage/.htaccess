@@ -1,0 +1,6 @@
+# storage/ holds the SQLite DB and session files - deny EVERYTHING.
+Require all denied
+
+<IfModule mod_php.c>
+    php_flag engine Off
+</IfModule>

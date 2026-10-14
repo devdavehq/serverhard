@@ -1,0 +1,284 @@
+# =====================================================================
+#  .htaccess  -  SERVER HARDENING (Apache 2.4+, PHP via libapache2/mod_php)
+#
+#  This is the heart of the project. Section after section locks the
+#  server down. The PHP dev server (`php -S`) IGNORES .htaccess, so the
+#  same rules are mirrored in router.php for local testing, and every
+#  rule below applies on a real Apache host.
+#
+#  Revision log for the REALLY sensitive rules lives at the end.
+# =====================================================================
+
+
+# =====================================================================
+#  SECTION 1 - Directory traversal & indexing
+# =====================================================================
+# Kill directory listings, CGI execution, and includes on the whole tree
+Options -Indexes -ExecCGI -Includes +FollowSymLinks
+
+# Remove ETag headers (avoid fingerprinting the server)
+FileETag None
+
+
+# =====================================================================
+#  SECTION 2 - Server information disclosure
+# =====================================================================
+ServerSignature Off          # banner on 4xx/5xx pages
+# NOTE: `ServerTokens Prod` is NOT allowed in .htaccess - put it in
+# httpd.conf / your site config to hide the full server version.
+
+# expose_php is an INI_SYSTEM setting: set it in php.ini/FPM pool as
+#   expose_php = Off
+# (in .htaccess it cannot be changed - see Section 9 for the full list)
+
+# Default charset so UTF-8 never gets sniffed as something else
+AddDefaultCharset UTF-8
+
+
+# =====================================================================
+#  SECTION 3 - HTTP method lockdown (TRACE/TRACK/PUT/DELETE are hostile)
+# =====================================================================
+LimitRequestBody 10485760    # 10 MB absolute cap on any request body
+
+<LimitExcept GET HEAD POST OPTIONS>
+    Require all denied
+</LimitExcept>
+
+# Explicitly the nastiest; TSV: deny every else already, but call it out
+<Limit TRACE TRACK>
+    Require all denied
+</Limit>
+
+
+# =====================================================================
+#  SECTION 4 - Block dotfiles / config / source / backup leftovers
+# =====================================================================
+<FilesMatch "^[._]">
+    Require all denied
+</FilesMatch>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # 4a. Every dotfile anywhere: .git, .gitignore, .env, .htaccess, .htpasswd,
+    #     .DS_Store, .cache, .user.ini -- 403.
+    RewriteRule (^|/)\. - [F,L]
+
+    # 4b. Editor/OS/backup/temporary leftovers from dev machines.
+    #     These are the files people forget to block: *.bak *.old *.orig *.~,
+    #     *.swp *.swo *.save *.sql *.zip *.tar *.gz *.log *.sh *.ps1 *.md,
+    #     *.json *.lock *.dist, and composer/package/npm manifests.
+    RewriteRule \.(?:bak|old|orig|~|swp|swo|save|sql|zip|tar|gz|log|sh|ps1|md|json|lock|dist|ini|tmp)$ - [F,L]
+
+    # 4c. Manifest / meta files that leak dependency info.
+    RewriteRule ^(?:composer|package|npm-shrinkwrap|yarn)\.(?:json|lock)$ - [F,L]
+
+    # 4d. Path traversal attempts, encoded or not, terminate with 400/403.
+    RewriteRule (^|/)\.\.(//|/?$) - [F,L]
+    RewriteRule (^|/)\.\./?$ - [F,L]
+    RewriteCond %{THE_REQUEST} (\.\.%2f|\.\./|%00) [NC,OR]
+    RewriteCond %{REQUEST_URI} (%2e%2e|%2f%2e%2e|%00) [NC]
+    RewriteRule .* - [F,L]
+</IfModule>
+
+
+# =====================================================================
+#  SECTION 5 - Sensitive directories can never be fetched or executed
+# =====================================================================
+# includes/ = PHP logic, storage/ = DB + sessions, config/ = settings,
+# vendor/ etc. If any of these land in the docroot, block them outright.
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(?:includes|config|storage|vendor|src|app)(/|$) - [F,L]
+    RewriteRule ^(?:composer\.json|composer\.lock)$ - [F,L]
+</IfModule>
+
+# And make PHP refuse to even execute inside them (defense in depth).
+# Each of those folders ships its own deny-all .htaccess too.
+<FilesMatch "\.(?:php[0-9]?|phtml|phar)$">
+    # execution is blocked by the rules above; this anchor documents intent
+</FilesMatch>
+
+
+# =====================================================================
+#  SECTION 6 - Writable / upload directories must be execution-free
+# =====================================================================
+# Any PHP arriving through an upload-style path is dead on arrival.
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(?:uploads?|files|media|tmp|web\/uploads)(?:\/|$).*\.(?:php[0-9]?|phtml|php7|php5|phar|inc|module)$ - [NC,F,L]
+</IfModule>
+
+# Belt & braces: disable the PHP engine inside any real uploads dir.
+# A tiny `uploads/.htaccess` with these two lines is the strongest guard:
+#     <IfModule mod_php.c>
+#         php_flag engine Off
+#     </IfModule>
+
+
+# =====================================================================
+#  SECTION 7 - Security response headers (every response)
+# =====================================================================
+<IfModule mod_headers.c>
+    # Clickjacking - never embed us in a frame or iframe
+    Header always set X-Frame-Options "DENY"
+
+    # Stop MIME sniffing that turns a text file into an HTML page
+    Header always set X-Content-Type-Options "nosniff"
+
+    # Don't leak the referral URL to third parties
+    Header always set Referrer-Policy "no-referrer"
+
+    # Capabilities are reserved for when they are actually used
+    Header always set Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=()"
+
+    # Kill the legacy XSS-auditor (it causes more holes than it patches)
+    Header always set X-XSS-Protection "0"
+
+    # CSP: no inline script/style, no external origins, no objects, no frames
+    Header always set Content-Security-Policy "default-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+
+    # Cross-origin isolation knobs for the browser security model
+    Header always set Cross-Origin-Opener-Policy "same-origin"
+    Header always set Cross-Origin-Resource-Policy "same-origin"
+
+    # HSTS -- only when actually on HTTPS (module sets env var itself)
+    Header set Strict-Transport-Security "max-age=31536000; includeSubDomains" env=HTTPS
+</IfModule>
+
+
+# =====================================================================
+#  SECTION 8 - Cookie hardening (overrides at the server level)
+# =====================================================================
+<IfModule mod_php.c>
+    php_value session.use_strict_mode 1      # never accept foreign session ids
+    php_value session.use_only_cookies 1     # no id-in-URL leakage
+    php_value session.use_trans_sid 0
+    php_value session.cookie_httponly 1      # JS cannot read the cookie
+    php_value session.cookie_samesite "Lax"  # CSRF friction
+    # Uncomment ONLY on an HTTPS-only site:
+    # php_value session.cookie_secure 1
+    php_value session.gc_maxlifetime 1800    # 30 min idle re-auth
+    php_value session.cache_limiter "nocache"
+    php_value session.sid_length 48
+    php_value session.sid_bits_per_character 6
+</IfModule>
+
+
+# =====================================================================
+#  SECTION 9 - Runtime hardening: errors, limits, timers
+# =====================================================================
+<IfModule mod_php.c>
+    # Errors go to a log file, never to the browser
+    php_flag display_errors Off
+    php_flag display_startup_errors Off
+    php_flag log_errors On
+    php_value error_reporting "E_ALL"
+
+    # Cap input sizes and resource usage (hard stop for abuse)
+    php_value upload_max_filesize 2M
+    php_value max_file_uploads 10
+    php_value post_max_size 8M
+    php_value max_input_vars 1000
+    php_value max_execution_time 30
+    php_value max_input_time 30
+    php_value memory_limit 128M
+</IfModule>
+
+# Settings the .htaccess layer CANNOT touch (they are INI_SYSTEM only).
+# On PHP-FPM put these in php.ini / FPM pool config:
+#     expose_php = Off
+#     open_basedir = "/var/www/serverhard:/tmp"
+#     disable_functions = "exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,show_source"
+#     allow_url_fopen = Off
+#     allow_url_include = Off
+#     max_execution_time = 30
+
+
+# =====================================================================
+#  SECTION 10 - Force HTTPS (production only; comment out for local)
+# =====================================================================
+# <IfModule mod_rewrite.c>
+#     RewriteEngine On
+#     RewriteCond %{HTTPS} !=on
+#     RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+# </IfModule>
+
+# Also refuse to serve the site via the old port if someone proxies
+# <IfModule mod_rewrite.c>
+#     RewriteCond %{SERVER_PORT} ^80$
+#     RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+# </IfModule>
+
+
+# =====================================================================
+#  SECTION 11 - Block known-bad payloads in the query string
+#  (XSS, SQLi, path weirdness -- typed as a 444/403 bot fence)
+# =====================================================================
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    RewriteCond %{QUERY_STRING} (<|%3C)([^s]*s)+cript.*(>|%3E) [NC,OR]      # <script
+    RewriteCond %{QUERY_STRING} (java)?script: [NC,OR]                     # javascript:
+    RewriteCond %{QUERY_STRING} GLOBALS(=|\[|\%[0-9A-Z]{0,2}) [OR]         # GLOBALS
+    RewriteCond %{QUERY_STRING} _REQUEST(=|\[|\%[0-9A-Z]{0,2}) [OR]        # _REQUEST override
+    RewriteCond %{QUERY_STRING} (union(\s|%20|\+)*select) [NC,OR]          # SQL union
+    RewriteCond %{QUERY_STRING} (concat|group_concat|concat_ws)\( [NC,OR]  # SQL concat
+    RewriteCond %{QUERY_STRING} (base64_(en|de)code|sleep|benchmark)\( [NC,OR]
+    RewriteCond %{QUERY_STRING} (%2e%2e|\.\.|%00|%0d%0a) [NC,OR]           # traversal / NULL / LF
+    RewriteCond %{QUERY_STRING} (\x00|\x04|\x08|\x0d|\x1b|\x1f) [NC]       # binary control chars
+    RewriteRule .* - [F,L]
+
+    # URL fingerprint probing (?author=5, ?page_id=123 enumeration) -> 403
+    RewriteCond %{QUERY_STRING} (^|&)(author|page_id|attachment_id|cats)=\d+ [NC]
+    RewriteRule .* - [F,L]
+</IfModule>
+
+
+# =====================================================================
+#  SECTION 12 - Compression (fewer bytes over the wire, also hides
+#  fingerprint data in HTML source ordering) + static asset caching
+# =====================================================================
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/css text/plain text/xml
+    AddOutputFilterByType DEFLATE application/json application/javascript application/xml
+    AddOutputFilterByType DEFLATE image/svg+xml
+</IfModule>
+
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType image/png "access plus 1 month"
+    ExpiresByType image/jpeg "access plus 1 month"
+    ExpiresByType image/gif "access plus 1 month"
+    ExpiresByType image/svg+xml "access plus 1 month"
+    ExpiresByType text/css "access plus 1 week"
+    ExpiresByType application/javascript "access plus 1 week"
+</IfModule>
+
+
+# =====================================================================
+#  SECTION 13 - Optional: per-IP gate for the admin area
+#  (uncomment on production to lock /admin to your office IPs)
+# =====================================================================
+# <IfModule mod_rewrite.c>
+#     RewriteEngine On
+#     RewriteRule ^admin - [E=ADMIN_IP_BLOCKED:1]
+#     RewriteCond %{ENV:ADMIN_IP_BLOCKED} =1
+#     RewriteCond %{REMOTE_ADDR} !^203\.0\.113\.10$
+#     RewriteCond %{REMOTE_ADDR} !^198\.51\.100\.4$
+#     RewriteRule ^ - [F,L]
+# </IfModule>
+
+
+# =====================================================================
+#  SECTION 14 - Optional: anti-hotlinking for images
+# =====================================================================
+# <IfModule mod_rewrite.c>
+#     RewriteEngine On
+#     RewriteCond %{HTTP_REFERER} !^$
+#     RewriteCond %{HTTP_REFERER} !^https?://(www\.)?yoursite\.com/ [NC]
+#     RewriteCond %{REQUEST_URI} \.(jpg|jpeg|png|gif|webp)$ [NC]
+#     RewriteRule .* - [F,L]
+# </IfModule>
+
+# End of hardening block.  Copyright note: adjust 13/14 to your domain.
